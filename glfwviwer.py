@@ -526,10 +526,11 @@ class InteractiveViewer:
                 up_normalized = np.cross(right, forward)
                 
                 # 在世界坐标中进行平移
+                # 修正：上下拖动方向改为正向，与 playground.py 一致
                 pan_speed = self.camera_pan_speed * self.camera_distance
-                self.camera_pan_x -= right[0] * delta[0] * pan_speed - up_normalized[0] * delta[1] * pan_speed
-                self.camera_pan_y -= right[1] * delta[0] * pan_speed - up_normalized[1] * delta[1] * pan_speed
-                self.camera_pan_z -= right[2] * delta[0] * pan_speed - up_normalized[2] * delta[1] * pan_speed
+                self.camera_pan_x -= right[0] * delta[0] * pan_speed + up_normalized[0] * delta[1] * pan_speed
+                self.camera_pan_y -= right[1] * delta[0] * pan_speed + up_normalized[1] * delta[1] * pan_speed
+                self.camera_pan_z -= right[2] * delta[0] * pan_speed + up_normalized[2] * delta[1] * pan_speed
                 
                 self._update_camera()
             
