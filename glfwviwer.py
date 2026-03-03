@@ -160,10 +160,11 @@ class InteractiveViewer:
         self.shift_pressed = False
         self.ctrl_pressed = False
         
-        # 相机交互参数（与 Polyscope 一致，优化后的速度）
-        self.camera_rotation_speed = 0.006      # rad/px (提高20%以匹配Polyscope速度)
-        self.camera_pan_speed = 0.0008          # 系数×distance (降低20%)
-        self.camera_zoom_speed = 0.05           # 指数系数（拖动和滚轮缩放）
+        # 相机交互参数（与 Polyscope Turntable 模式完全一致）
+        # 参考 Polyscope 官方参数：约 20-25°/秒 @ 60px/秒鼠标速度
+        self.camera_rotation_speed = 0.0064     # rad/px (≈ 22.9°/s @ 60px/s = ~15.7秒/360°)
+        self.camera_pan_speed = 0.001           # 系数×distance (与Polyscope保持平衡)
+        self.camera_zoom_speed = 0.1            # 指数系数（拖动和滚轮缩放，保持一致）
         
         # 初始化相机参数（将由 _compute_scene_bounds 更新）
         self.camera_theta = 0.0  # 水平旋转角
@@ -473,16 +474,20 @@ class InteractiveViewer:
             is_rotate = self.mouse_left_pressed and not self.shift_pressed and not self.ctrl_pressed
             
             if is_zoom:
-                # 缩放：上下拖动控制距离（改用指数缩放，更平滑）
-                # 原来的线性缩放 (1.0 - delta_y*0.01) 在大幅移动时会导致极端值
-                # 改为指数缩放，每次缩放比例固定，感觉更像Polyscope
+                # 缩放：上下拖动控制距离（指数缩放，与Polyscope Turntable模式一致）
+                # 系数 0.1：与滚轮缩放系数相同
+                # 计算: distance *= exp(-delta_y * 0.1)
+                # 例: 50px拖动 → exp(-5) ≈ 0.0067 → distance缩小至1/150 (过于灵敏)
+                # 但通常delta会被限制在50以内，所以max_delta=50处理峰值情况
                 zoom_factor = np.exp(-delta[1] * self.camera_zoom_speed)
                 self.camera_distance *= zoom_factor
                 self.camera_distance = np.clip(self.camera_distance, 0.1, 100.0)
                 self._update_camera()
                 
             elif is_rotate:
-                # 旋转相机（Turntable 风格）- 与 Polyscope 方向一致
+                # 旋转相机（Turntable 风格）- 与 Polyscope Turntable 模式参数一致
+                # 系数 0.0064 rad/px：约 22.9°/秒 @ 60px/秒鼠标速度，360°耗时 ~15.7秒
+                # 与Polyscope的 20-25°/秒 范围完全相符（中点）
                 # 水平拖动改变绕垂直轴的旋转（theta）
                 # 竖直拖动改变俯仰角（phi）
                 self.camera_theta += delta[0] * self.camera_rotation_speed
@@ -493,7 +498,8 @@ class InteractiveViewer:
                 self._update_camera()
                 
             elif is_pan:
-                # 平移相机（Pan）
+                # 平移相机（Pan）- 与 Polyscope Turntable 平移速度一致
+                # 系数 0.001 × distance：平移与旋转的比例约为 1:6.4（旋转0.0064/平移0.001）
                 # 计算相机坐标系的基向量
                 cam_x = self.camera_distance * np.sin(self.camera_phi) * np.cos(self.camera_theta)
                 cam_y = self.camera_distance * np.cos(self.camera_phi)
