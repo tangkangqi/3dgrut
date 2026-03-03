@@ -160,10 +160,10 @@ class InteractiveViewer:
         self.shift_pressed = False
         self.ctrl_pressed = False
         
-        # 相机交互参数（与 Polyscope Turntable 模式一致）
-        self.camera_rotation_speed = 0.005
-        self.camera_pan_speed = 0.001
-        self.camera_zoom_speed = 0.1
+        # 相机交互参数（与 Polyscope 一致，优化后的速度）
+        self.camera_rotation_speed = 0.006      # rad/px (提高20%以匹配Polyscope速度)
+        self.camera_pan_speed = 0.0008          # 系数×distance (降低20%)
+        self.camera_zoom_speed = 0.05           # 指数系数（拖动和滚轮缩放）
         
         # 初始化相机参数（将由 _compute_scene_bounds 更新）
         self.camera_theta = 0.0  # 水平旋转角
@@ -200,63 +200,72 @@ class InteractiveViewer:
         logger.info("  Q / ESC                   → Quit (退出)")
     
     def _compute_scene_bounds(self):
-        """计算场景边界盒并自动初始化相机使物体居中显示"""
+        """计算场景边界盒（与Polyscope保持一致：固定范围[-1.5, 1.5]³）"""
         try:
             # 获取高斯的位置
             positions = self.engine.scene_mog.positions.detach().cpu().numpy()
             
-            # 计算边界盒
+            # 计算边界盒（用于调试，但不用于相机初始化）
             bbox_min = positions.min(axis=0)
             bbox_max = positions.max(axis=0)
-            bbox_center = (bbox_min + bbox_max) / 2.0
             bbox_size = bbox_max - bbox_min
-            
-            # 计算场景的对角线长度
             scene_diagonal = np.linalg.norm(bbox_size)
             
-            # 存储场景信息
-            self.scene_center = bbox_center
+            # 存储实际场景信息（用于调试）
             self.scene_bbox_min = bbox_min
             self.scene_bbox_max = bbox_max
             self.scene_diagonal = scene_diagonal
             
-            logger.info(f"Scene bounds: min={bbox_min}, max={bbox_max}")
-            logger.info(f"Scene center: {bbox_center}, diagonal: {scene_diagonal:.4f}")
+            # 与 Polyscope 保持一致：固定中心点和范围
+            # 假设场景已经经过处理，范围在 [-1.5, 1.5]³ 内
+            self.scene_center = np.array([0.0, 0.0, 0.0])      # 固定中心
+            self.scene_bbox_min_fixed = np.array([-1.5, -1.5, -1.5])  # Polyscope固定范围
+            self.scene_bbox_max_fixed = np.array([1.5, 1.5, 1.5])
+            
+            logger.info(f"Scene bounds (actual): min={bbox_min}, max={bbox_max}")
+            logger.info(f"Scene bounds (Polyscope fixed): min={self.scene_bbox_min_fixed}, max={self.scene_bbox_max_fixed}")
+            logger.info(f"Scene diagonal: {scene_diagonal:.4f}")
         except Exception as e:
             logger.warning(f"Failed to compute scene bounds: {e}")
-            # 使用默认值
+            # 使用 Polyscope 的默认值
             self.scene_center = np.array([0.0, 0.0, 0.0])
+            self.scene_bbox_min_fixed = np.array([-1.5, -1.5, -1.5])
+            self.scene_bbox_max_fixed = np.array([1.5, 1.5, 1.5])
             self.scene_diagonal = 1.0
     
     def _initialize_camera_from_bounds(self):
-        """根据场景边界初始化相机位置，确保物体完全可见并居中"""
-        # 计算合适的相机距离
-        height = self.scene_bbox_max[1] - self.scene_bbox_min[1]
-        fov_rad = np.deg2rad(self.engine.camera_fov)
+        """初始化相机（与Polyscope保持一致：固定中心和范围）"""
+        # 与 Polyscope 一致：固定中心点和相机距离
+        # Polyscope 使用固定的 [-1.5, 1.5]³ 范围
         
-        # 距离计算：物体高度 / (2 * tan(FOV/2))
-        # 这确保物体高度能够适配到视口中
-        self.camera_distance = (height / (2.0 * np.tan(fov_rad / 2.0))) * 1.1
+        # 场景中心（固定）
+        self.camera_pan_x = 0.0  # 固定中心
+        self.camera_pan_y = 0.0
+        self.camera_pan_z = 0.0
         
-        # 确保最小距离（对角线的1.2倍）
-        if self.camera_distance < self.scene_diagonal * 0.8:
-            self.camera_distance = self.scene_diagonal * 1.2
+        # 计算合适的相机距离，使 [-1.5, 1.5]³ 范围完全可见
+        # 对于固定的3×3×3立方体
+        bbox_size = 3.0  # [-1.5, 1.5] → 宽度为3
+        fov_rad = np.deg2rad(self.engine.camera_fov)  # 45度
         
-        # 相机围绕场景中心旋转
-        self.camera_pan_x = self.scene_center[0]
-        self.camera_pan_y = self.scene_center[1]
-        self.camera_pan_z = self.scene_center[2]
+        # 距离公式：size / (2 * tan(FOV/2)) * 1.0（Polyscope的标准做法）
+        # tan(22.5°) ≈ 0.414
+        self.camera_distance = bbox_size / (2.0 * np.tan(fov_rad / 2.0))
+        # 45° FOV: distance = 3.0 / (2 * tan(22.5°)) ≈ 3.0 / 0.828 ≈ 3.625
         
-        # 初始化旋转角度 - 调整为更好地显示物体
-        # phi（竖直角）：从上往下看的角度
-        # 设置为 30 度 (π/6) 获得更好的初始视角
-        self.camera_theta = 0.0  # 水平角度
-        self.camera_phi = np.pi / 6.0  # 竖直角度（30度）
+        # 初始化旋转角度 - 与 Polyscope Free 模式的初始视角类似
+        # 但由于我们限制在 Turntable 模式，设置为好的观察角度
+        self.camera_theta = 0.0      # 从+X方向看
+        self.camera_phi = np.pi / 4.0  # 45度（而不是30度，更接近Polyscope的Free模式）
         
         # 更新相机矩阵
         self._update_camera()
         
-        logger.info(f"Camera initialized: distance={self.camera_distance:.4f}, center={self.scene_center}")
+        logger.info(f"Camera initialized (Polyscope-like mode):")
+        logger.info(f"  Fixed center: ({self.camera_pan_x:.1f}, {self.camera_pan_y:.1f}, {self.camera_pan_z:.1f})")
+        logger.info(f"  Fixed range: [-1.5, 1.5]³")
+        logger.info(f"  Camera distance: {self.camera_distance:.4f}")
+        logger.info(f"  Initial theta: {np.degrees(self.camera_theta):.1f}°, phi: {np.degrees(self.camera_phi):.1f}°")
     
     def _update_camera(self):
         """更新相机参数"""
@@ -464,8 +473,10 @@ class InteractiveViewer:
             is_rotate = self.mouse_left_pressed and not self.shift_pressed and not self.ctrl_pressed
             
             if is_zoom:
-                # 缩放：上下拖动控制距离
-                zoom_factor = 1.0 - delta[1] * 0.01
+                # 缩放：上下拖动控制距离（改用指数缩放，更平滑）
+                # 原来的线性缩放 (1.0 - delta_y*0.01) 在大幅移动时会导致极端值
+                # 改为指数缩放，每次缩放比例固定，感觉更像Polyscope
+                zoom_factor = np.exp(-delta[1] * self.camera_zoom_speed)
                 self.camera_distance *= zoom_factor
                 self.camera_distance = np.clip(self.camera_distance, 0.1, 100.0)
                 self._update_camera()
