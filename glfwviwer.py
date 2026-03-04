@@ -9,6 +9,7 @@ import os
 import time
 from pathlib import Path
 
+import cv2
 import glfw
 import numpy as np
 import torch
@@ -52,6 +53,18 @@ class InteractiveViewer:
     3DGS交互式查看器（使用3DGRUT引擎）
     实时显示鼠标控制的3D高斯溅射渲染结果
     """
+
+    HUD_FONT = cv2.FONT_HERSHEY_SIMPLEX
+    HUD_FONT_SCALE = 0.46
+    HUD_TEXT_THICKNESS = 1
+    HUD_LINE_HEIGHT = 18
+    HUD_MARGIN = 10
+    HUD_TEXT_BASELINE_OFFSET = 8
+    HUD_BOX_X = 8
+    HUD_BOX_Y = 8
+    HUD_BACKGROUND_DARKEN = 0.35
+    HUD_STROKE_COLOR = (0.0, 0.0, 0.0)
+    HUD_TEXT_COLOR = (0.95, 0.95, 0.95)
     
     def __init__(self, 
                  gs_object: str,
@@ -186,6 +199,8 @@ class InteractiveViewer:
         # 渲染参数
         self.render_style_index = 0
         self.render_styles = ["color", "density"]
+
+        self._initialize_hud_state_cache()
         
         logger.info("✅ Interactive Viewer initialized successfully!")
         logger.info("\n🎮 Controls (Turntable Mode - 与 Polyscope 一致):")
@@ -543,6 +558,227 @@ class InteractiveViewer:
         self.camera_distance *= zoom_factor
         self.camera_distance = np.clip(self.camera_distance, 0.1, 100.0)
         self._update_camera()
+
+    def _initialize_hud_state_cache(self):
+        """初始化HUD缓存（避免每帧读取完整高斯数据）"""
+        self.object_state_cache = {
+            "center": np.zeros(3, dtype=np.float32),
+            "extent": np.zeros(3, dtype=np.float32),
+            "mean_scale": np.zeros(3, dtype=np.float32),
+            "mean_quat": np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+            "mean_euler_deg": np.zeros(3, dtype=np.float32),
+        }
+        self.object_state_update_interval = 0.5
+        self.object_state_last_update = 0.0
+        self._update_object_state_cache(force=True)
+
+    def _quat_wxyz_to_euler_deg(self, quat_wxyz: np.ndarray) -> np.ndarray:
+        """四元数(w, x, y, z)转欧拉角(roll, pitch, yaw) [deg]"""
+        w, x, y, z = quat_wxyz
+
+        sinr_cosp = 2.0 * (w * x + y * z)
+        cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+        roll = np.arctan2(sinr_cosp, cosr_cosp)
+
+        sinp = 2.0 * (w * y - z * x)
+        sinp = np.clip(sinp, -1.0, 1.0)
+        pitch = np.arcsin(sinp)
+
+        siny_cosp = 2.0 * (w * z + x * y)
+        cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+        yaw = np.arctan2(siny_cosp, cosy_cosp)
+
+        return np.degrees(np.array([roll, pitch, yaw], dtype=np.float32))
+
+    def _update_object_state_cache(self, force: bool = False):
+        """周期性更新对象姿态统计（中心、尺度、旋转）"""
+        now = time.time()
+        if not force and not self._should_refresh_object_state_cache(now):
+            return
+
+        try:
+            self.object_state_cache = self._collect_object_state_snapshot()
+            self.object_state_last_update = now
+        except Exception as e:
+            logger.debug(f"Object state cache update failed: {e}")
+
+    def _should_refresh_object_state_cache(self, now: float) -> bool:
+        """判断当前时刻是否需要刷新对象状态缓存"""
+        return (now - self.object_state_last_update) >= self.object_state_update_interval
+
+    def _collect_object_state_snapshot(self) -> dict[str, np.ndarray]:
+        """采集对象状态快照（中心、范围、尺度、旋转）"""
+        mog = self.engine.scene_mog
+        positions = mog.positions
+
+        center = positions.mean(dim=0)
+        bbox_min = positions.min(dim=0).values
+        bbox_max = positions.max(dim=0).values
+        extent = bbox_max - bbox_min
+
+        mean_scale = mog.get_scale().mean(dim=0)
+        mean_quat = mog.get_rotation().mean(dim=0)
+        mean_quat = mean_quat / torch.clamp(torch.linalg.norm(mean_quat), min=1e-8)
+        mean_quat_np = mean_quat.detach().cpu().numpy().astype(np.float32)
+
+        return {
+            "center": center.detach().cpu().numpy().astype(np.float32),
+            "extent": extent.detach().cpu().numpy().astype(np.float32),
+            "mean_scale": mean_scale.detach().cpu().numpy().astype(np.float32),
+            "mean_quat": mean_quat_np,
+            "mean_euler_deg": self._quat_wxyz_to_euler_deg(mean_quat_np),
+        }
+
+    def _get_mouse_action_label(self) -> str:
+        """返回当前鼠标交互模式文本"""
+        is_zoom = self.ctrl_pressed and self.shift_pressed and self.mouse_left_pressed
+        is_pan = (self.shift_pressed and self.mouse_left_pressed) or self.mouse_right_pressed
+        is_rotate = self.mouse_left_pressed and not self.shift_pressed and not self.ctrl_pressed
+
+        if is_zoom:
+            return "Zoom"
+        if is_pan:
+            return "Pan"
+        if is_rotate:
+            return "Rotate"
+        return "Idle"
+
+    def _format_runtime_memory_usage(self) -> str:
+        """格式化当前进程内存与渲染显存占用文本"""
+        ram_gb = 0.0
+        try:
+            with open("/proc/self/status", "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        parts = line.split()
+                        ram_kb = float(parts[1])
+                        ram_gb = ram_kb / (1024.0 * 1024.0)
+                        break
+        except Exception:
+            ram_gb = 0.0
+
+        vram_text = "N/A"
+        try:
+            if torch.cuda.is_available() and str(self.engine.device).startswith("cuda"):
+                device = self.engine.device
+                allocated = torch.cuda.memory_allocated(device) / (1024.0 ** 3)
+                reserved = torch.cuda.memory_reserved(device) / (1024.0 ** 3)
+                vram_text = f"{allocated:.2f}/{reserved:.2f} GB"
+        except Exception:
+            vram_text = "N/A"
+
+        return f"Memory: VRAM={vram_text} | RAM={ram_gb:.2f} GB"
+
+    def _build_hud_lines(self) -> list[str]:
+        """构建左上角HUD文本内容"""
+        self._update_object_state_cache()
+        state = self.object_state_cache
+
+        center = state["center"]
+        extent = state["extent"]
+        mean_scale = state["mean_scale"]
+        mean_quat = state["mean_quat"]
+        mean_euler = state["mean_euler_deg"]
+
+        mode = self._get_mouse_action_label()
+
+        return [
+            f"FPS: {self.fps:5.1f} | Style: {self.render_styles[self.render_style_index]}",
+            self._format_runtime_memory_usage(),
+            "Mouse: L=Rotate | Shift+L / R=Pan | Ctrl+Shift+L / Wheel=Zoom",
+            f"Mouse Pos: ({self.mouse_pos[0]:.0f}, {self.mouse_pos[1]:.0f}) | Mode: {mode}",
+            (
+                f"Buttons[L,R,M]=[{int(self.mouse_left_pressed)},{int(self.mouse_right_pressed)},"
+                f"{int(self.mouse_middle_pressed)}] | Mods[Shift,Ctrl]=[{int(self.shift_pressed)},{int(self.ctrl_pressed)}]"
+            ),
+            (
+                f"Camera Orbit(deg): theta={np.degrees(self.camera_theta):.1f}, "
+                f"phi={np.degrees(self.camera_phi):.1f} | dist={self.camera_distance:.3f}"
+            ),
+            f"Object Center: ({center[0]:.4f}, {center[1]:.4f}, {center[2]:.4f})",
+            f"Object Extent: ({extent[0]:.4f}, {extent[1]:.4f}, {extent[2]:.4f})",
+            f"Object Scale(mean xyz): ({mean_scale[0]:.4f}, {mean_scale[1]:.4f}, {mean_scale[2]:.4f})",
+            (
+                f"Object Rot quat(wxyz): ({mean_quat[0]:.4f}, {mean_quat[1]:.4f}, "
+                f"{mean_quat[2]:.4f}, {mean_quat[3]:.4f})"
+            ),
+            (
+                f"Object Orient rpy(deg): ({mean_euler[0]:.1f}, "
+                f"{mean_euler[1]:.1f}, {mean_euler[2]:.1f})"
+            ),
+        ]
+
+    def _draw_hud_overlay(self, rgb: np.ndarray) -> np.ndarray:
+        """在图像左上角绘制实时状态HUD"""
+        if rgb.ndim != 3 or rgb.shape[2] != 3:
+            return rgb
+
+        # OpenGL 纹理坐标与图像坐标上下方向相反：
+        # 先翻转到屏幕坐标系绘制，再翻回原坐标系上传纹理。
+        hud = np.ascontiguousarray(np.flipud(rgb))
+        lines = self._build_hud_lines()
+
+        box_x, box_y, box_w, box_h = self._compute_hud_box_geometry(hud, lines)
+        if box_w <= 2 or box_h <= 2:
+            return hud
+
+        self._apply_hud_background(hud, box_x, box_y, box_w, box_h)
+        self._draw_hud_lines(hud, lines, box_x, box_y, box_h)
+
+        return np.ascontiguousarray(np.flipud(hud))
+
+    def _compute_hud_box_geometry(self, hud: np.ndarray, lines: list[str]) -> tuple[int, int, int, int]:
+        """计算HUD面板在图像中的包围盒"""
+        text_sizes = [
+            cv2.getTextSize(line, self.HUD_FONT, self.HUD_FONT_SCALE, self.HUD_TEXT_THICKNESS)[0]
+            for line in lines
+        ]
+        max_text_width = max((w for w, _ in text_sizes), default=0)
+
+        box_x = self.HUD_BOX_X
+        box_y = self.HUD_BOX_Y
+        box_w = min(max_text_width + self.HUD_MARGIN * 2, hud.shape[1] - box_x - 2)
+        box_h = min(len(lines) * self.HUD_LINE_HEIGHT + self.HUD_MARGIN * 2, hud.shape[0] - box_y - 2)
+        return box_x, box_y, box_w, box_h
+
+    def _apply_hud_background(self, hud: np.ndarray, box_x: int, box_y: int, box_w: int, box_h: int):
+        """绘制HUD背景（暗色半透明效果）"""
+        roi = hud[box_y:box_y + box_h, box_x:box_x + box_w]
+        roi *= self.HUD_BACKGROUND_DARKEN
+
+    def _draw_hud_lines(self, hud: np.ndarray, lines: list[str], box_x: int, box_y: int, box_h: int):
+        """逐行绘制HUD文本"""
+        text_x = box_x + self.HUD_MARGIN
+        for idx, line in enumerate(lines):
+            text_y = (
+                box_y
+                + self.HUD_MARGIN
+                + (idx + 1) * self.HUD_LINE_HEIGHT
+                - self.HUD_TEXT_BASELINE_OFFSET
+            )
+            if text_y >= box_y + box_h - 2:
+                break
+
+            cv2.putText(
+                hud,
+                line,
+                (text_x, text_y),
+                self.HUD_FONT,
+                self.HUD_FONT_SCALE,
+                self.HUD_STROKE_COLOR,
+                2,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                hud,
+                line,
+                (text_x, text_y),
+                self.HUD_FONT,
+                self.HUD_FONT_SCALE,
+                self.HUD_TEXT_COLOR,
+                1,
+                cv2.LINE_AA,
+            )
     
     @torch.no_grad()
     def render_frame(self):
@@ -579,6 +815,9 @@ class InteractiveViewer:
                 rgb = rgb[:, :, :3]
             elif rgb.shape[2] == 1:  # 灰度 -> RGB
                 rgb = np.repeat(rgb, 3, axis=2)
+
+        # 绘制左上角实时状态信息
+        rgb = self._draw_hud_overlay(rgb)
         
         # 确保数据布局连续
         rgb = np.ascontiguousarray(rgb)
